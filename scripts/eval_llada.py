@@ -57,6 +57,8 @@ class LLaDAEvalHarness(LM):
         thread=0.9,
         gamma=0.01,
         num_remask_tokens=4,
+        refine_every=1,
+        nucleus_p=1.0,
         **kwargs,
     ):
         '''
@@ -129,6 +131,8 @@ class LLaDAEvalHarness(LM):
         self.thread = thread
         self.gamma = gamma
         self.num_remask_tokens = num_remask_tokens
+        self.refine_every = refine_every
+        self.nucleus_p = nucleus_p
 
     @property
     def rank(self):
@@ -310,6 +314,20 @@ class LLaDAEvalHarness(LM):
             elif self.mode == 'linear':
                 from src.generate import generate_with_linear_position
                 generated_answer = generate_with_linear_position(self.model, prompt, self.steps, self.gen_length, self.block_length, self.lambd, self.alpha, self.baseline_name, self.temperature, cfg_scale=0., remasking=self.remasking)
+            elif self.mode == 'refine_ent_3':
+                # LLaDA + refine-ent-3 (2-forward refine, entropy overwrite)
+                from src.generate import generate_with_refine_ent3
+                generated_answer = generate_with_refine_ent3(
+                    self.model,
+                    prompt,
+                    steps=self.steps,
+                    gen_length=self.gen_length,
+                    block_length=self.block_length,
+                    temperature=self.temperature,
+                    remasking=self.remasking,
+                    refine_every=getattr(self, "refine_every", 1),
+                    nucleus_p=getattr(self, "nucleus_p", 1.0),
+                )
             else:
                 raise NotImplementedError(f"Mode {self.mode} not implemented.")
             

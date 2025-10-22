@@ -13,7 +13,7 @@ from src.llama_template import llama_prompt
 
 random.seed(42)
 
-def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens):
+def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens, refine_every=1, nucleus_p=1.0):
 
     query = query_extract(input, task)
     m = [{"role": "user", "content": query}]
@@ -41,6 +41,19 @@ def generate(model, tokenizer, input, task, steps, gen_length, block_length, tem
     elif mode == 'linear':
         from src.generate import generate_with_linear_position
         out = generate_with_linear_position(model, prompt, steps, gen_length, block_length, lambd, alpha, baseline_name, temperature, cfg_scale=0., remasking='low_confidence')
+    elif mode == 'refine_ent_3':
+        # LLaDA용 refine-ent-3 (2-forward refine + entropy overwrite)
+        from src.generate import generate_with_refine_ent3
+        out = generate_with_refine_ent3(
+            model, prompt,
+            steps=steps,
+            gen_length=gen_length,
+            block_length=block_length,
+            temperature=temperature,
+            remasking='low_confidence',
+            refine_every=refine_every,
+            nucleus_p=nucleus_p
+        )
     else:
         raise NotImplementedError(f"Mode {mode} not implemented.")
     
@@ -114,6 +127,9 @@ def main(args):
     num_remask_tokens = args.num_remask_tokens
     data_path = args.data_path
     result_path = args.result_path
+    # refine-ent-3
+    refine_every = args.refine_every
+    nucleus_p = args.nucleus_p
 
     dataset = load_dataset(data_path, task)
 
@@ -138,7 +154,13 @@ def main(args):
         elif 'Qwen2.5' in model_name:
             answer = Qwen_25_generate(model, tokenizer, input, task, gen_length)
         else:
-            answer = generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens)
+            answer = generate(
+                model, tokenizer, input, task,
+                steps, gen_length, block_length,
+                temperature, mode, lambd, alpha, baseline_name,
+                thread, gamma, num_remask_tokens,
+                refine_every=refine_every, nucleus_p=nucleus_p
+            )
         results.append(answer)
 
     eval(task, results, dataset, result_path, args)
@@ -163,5 +185,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_remask_tokens', type=int, default=10)
     parser.add_argument('--data_path', type=str, default='./data/humaneval.jsonl')
     parser.add_argument('--result_path', type=str, default='../results/humaneval_results')
+    # refine-ent-3 전용 하이퍼파라미터
+    parser.add_argument('--refine_every', type=int, default=1)
+    parser.add_argument('--nucleus_p', type=float, default=1.0)
     args = parser.parse_args()
     main(args)
