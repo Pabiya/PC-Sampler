@@ -13,7 +13,7 @@ from src.llama_template import llama_prompt
 
 random.seed(42)
 
-def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens, refine_every=1, nucleus_p=1.0):
+def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens, refine_every=1, nucleus_p=1.0, init_unmask_ratio=0.75, loop_steps=256, unmask_k=1):
 
     query = query_extract(input, task)
     m = [{"role": "user", "content": query}]
@@ -41,6 +41,18 @@ def generate(model, tokenizer, input, task, steps, gen_length, block_length, tem
     elif mode == 'linear':
         from src.generate import generate_with_linear_position
         out = generate_with_linear_position(model, prompt, steps, gen_length, block_length, lambd, alpha, baseline_name, temperature, cfg_scale=0., remasking='low_confidence')
+    elif mode == 'remdm':
+        from src.generate import generate_with_remdm
+        out = generate_with_remdm(
+            model, prompt,
+            gen_length=gen_length,
+            init_unmask_ratio=init_unmask_ratio,
+            unmask_k=unmask_k,
+            loop_steps=loop_steps,
+            temperature=temperature,
+            cfg_scale=0.0,
+            tokenizer=tokenizer
+        )
     elif mode == 'refine_ent_3':
         # LLaDA용 refine-ent-3 (2-forward refine + entropy overwrite)
         from src.generate import generate_with_refine_ent3
@@ -127,6 +139,10 @@ def main(args):
     num_remask_tokens = args.num_remask_tokens
     data_path = args.data_path
     result_path = args.result_path
+    #remdm
+    init_unmask_ratio = args.init_unmask_ratio
+    loop_steps = args.loop_steps
+    unmask_k = args.unmask_k
     # refine-ent-3
     refine_every = args.refine_every
     nucleus_p = args.nucleus_p
@@ -159,7 +175,8 @@ def main(args):
                 steps, gen_length, block_length,
                 temperature, mode, lambd, alpha, baseline_name,
                 thread, gamma, num_remask_tokens,
-                refine_every=refine_every, nucleus_p=nucleus_p
+                refine_every=refine_every, nucleus_p=nucleus_p,
+                init_unmask_ratio=init_unmask_ratio, loop_steps=loop_steps, unmask_k=unmask_k
             )
         results.append(answer)
 
@@ -185,6 +202,10 @@ if __name__ == '__main__':
     parser.add_argument('--num_remask_tokens', type=int, default=10)
     parser.add_argument('--data_path', type=str, default='./data/humaneval.jsonl')
     parser.add_argument('--result_path', type=str, default='../results/humaneval_results')
+    #remdm
+    parser.add_argument('--init_unmask_ratio', type=float, default=0.75)
+    parser.add_argument('--loop_steps', type=int, default=256)
+    parser.add_argument('--unmask_k', type=int, default=1)
     # refine-ent-3 전용 하이퍼파라미터
     parser.add_argument('--refine_every', type=int, default=1)
     parser.add_argument('--nucleus_p', type=float, default=1.0)
