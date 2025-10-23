@@ -892,14 +892,136 @@ def _confidence_from_logits(logits, x0, mask_index, mask_id, metric="prob"):
 #         x_result = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
 #     return x
 
-import torch
-import torch.nn.functional as F
+@torch.no_grad()
+def generate_with_remdm_paper(
+    model,
+    prompt: torch.Tensor,                 # (1, P)
+    gen_length: int = 32,                 # 논문 세팅
+    init_unmask_ratio: float = 0.875,     # 28/32 = 0.875
+    loop_steps: int = 32,                 # 논문 세팅
+    unmask_k: int = 1,                    # Countdown=1, TruthfulQA=4 등
+    temperature: float = 0.0,             # 논문에선 greedy + 일부 실험에서 랜덤
+    cfg_scale: float = 0.0,               # 0이면 CFG 비활성
+    mask_id: int = 126336,                # LLaDA/LLaMA-류 마스크 토큰 id (환경에 맞춰 교체)
+    tokenizer=None,                       # 필요시 후처리용(반환값에는 미사용)
+):
+    """
+    Paper-style ReMDM-on-LLaDA sampler (deterministic K-remask loop):
+
+    Phase A (Initial fill): init_unmask_ratio*gen_length 만큼 기존 LLaDA 방식으로
+      [MASK] 중 상위-K 확신 위치를 선택해 채움. (K씩 반복)
+
+    Phase B (Loop, alpha-fixed-like): loop_steps 번 반복하며,
+      1) 현재 생성된(프롬프트 제외) 토큰 중 confidence 최하위 K개를 리마스크
+      2) 곧바로 [MASK] 중에서 confidence 최상위 K개를 재언마스크
+      (K를 보존하여 난이도/마스크 예산을 고정 = α-고정에 가까운 루프)
+
+    Phase C (Finalize): 남은 [MASK]를 기존 방식으로 K씩 채워 완성.
+    """
+
+    assert prompt.ndim == 2 and prompt.size(0) == 1, "prompt must be (1, P)"
+    device = model.device if hasattr(model, "device") else prompt.device
+
+    # 준비: (1, P+G) 시퀀스 할당 및 프롬프트 고정
+    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt.shape[1]] = prompt
+    prompt_mask = (x != mask_id)  # 프롬프트 위치 True
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # CFG용 전방 패스: (일반 conditioned, "언컨디셔닝" 쌍) → logits 혼합
+    # 주의: 언컨 템플릿은 환경에 맞게 바꾸는 게 가장 안전함. 여기선 프롬프트를 마스크로 대체.
+    def forward_logits(seq):
+        if cfg_scale and cfg_scale > 0.0:
+            un_x = seq.clone()
+            un_x[prompt_mask] = mask_id
+            x_cat = torch.cat([seq, un_x], dim=0)             # (2, T)
+            logits = model(x_cat).logits                       # (2, T, V)
+            cond, uncond = torch.chunk(logits, 2, dim=0)      # (1,T,V) each
+            return uncond + (cfg_scale + 1.0) * (cond - uncond)
+        else:
+            return model(seq).logits                           # (1, T, V)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # A) 초기 채우기: init_unmask_ratio * gen_length 만큼 K씩 언마스크
+    num_initial = int(gen_length * init_unmask_ratio)
+    assert gen_length % max(unmask_k, 1) == 0, "gen_length must be divisible by unmask_k"
+    assert num_initial % max(unmask_k, 1) == 0, "init_unmask_ratio*gen_length must be divisible by unmask_k"
+
+    for _ in range(num_initial // unmask_k):
+        mask_pos = (x == mask_id)
+        if not mask_pos.any():
+            break
+
+        logits = forward_logits(x)
+        logits_noisy = _add_gumbel_noise(logits, temperature=temperature)
+        x0 = torch.argmax(logits_noisy, dim=-1)                             # (1, T)
+        p = F.softmax(logits, dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (1, T)
+
+        # [MASK] 중 확신 top-K 선택
+        conf_masked = torch.where(mask_pos, x0_p, torch.full_like(x0_p, -float("inf")))
+        _, topk_idx = torch.topk(conf_masked, k=unmask_k, dim=-1)
+        topk_idx = topk_idx[0]  # 안전 인덱싱
+        x[0, topk_idx] = x0[0, topk_idx]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # B) Loop 단계: 매 스텝 저신뢰 K개 리마스크 → K개 재언마스크 (α-고정 유사)
+    for _ in range(loop_steps):
+        # 1) 현재 생성 구간(프롬프트 제외) 중에서 confidence 최하위 K 개 리마스크
+        gen_pos = (x != mask_id) & (~prompt_mask)
+        num_unmasked_gen = int(gen_pos.sum().item())
+        if num_unmasked_gen <= 0:
+            continue
+        k_r = min(unmask_k, num_unmasked_gen)
+
+        logits = forward_logits(x)
+        p = F.softmax(logits, dim=-1)
+        cur_token_p = torch.gather(p, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (1, T)
+        # 생성 토큰의 현재 확률(=confidence). 값이 낮을수록 나쁨.
+        conf_unmasked = torch.where(gen_pos, cur_token_p, torch.full_like(cur_token_p, float("inf")))
+        _, lowk_idx = torch.topk(conf_unmasked, k=k_r, dim=-1, largest=False)
+        lowk_idx = lowk_idx[0]
+        x[0, lowk_idx] = mask_id  # 리마스크
+
+        # 2) 바로 K개 재언마스크: 방금 마스크된 자리를 우선 포함하지만,
+        #    일반적으로는 전체 [MASK] 중 top-K를 뽑아 같은 규모로 채움
+        mask_pos = (x == mask_id)
+        if mask_pos.any():
+            logits = forward_logits(x)
+            logits_noisy = _add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_noisy, dim=-1)
+            p_new = F.softmax(logits, dim=-1)
+            x0_p_new = torch.gather(p_new, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+            conf_masked = torch.where(mask_pos, x0_p_new, torch.full_like(x0_p_new, -float("inf")))
+            _, upk_idx = torch.topk(conf_masked, k=k_r, dim=-1)
+            upk_idx = upk_idx[0]
+            x[0, upk_idx] = x0[0, upk_idx]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # C) 마무리: 남은 [MASK]를 K씩 채우기
+    while (x == mask_id).any():
+        mask_pos = (x == mask_id)
+        k_f = min(unmask_k, int(mask_pos.sum().item()))
+        if k_f <= 0:
+            break
+
+        logits = forward_logits(x)
+        logits_noisy = _add_gumbel_noise(logits, temperature=temperature)
+        x0 = torch.argmax(logits_noisy, dim=-1)
+        p = F.softmax(logits, dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+        conf_masked = torch.where(mask_pos, x0_p, torch.full_like(x0_p, -float("inf")))
+        _, topk_idx = torch.topk(conf_masked, k=k_f, dim=-1)
+        topk_idx = topk_idx[0]
+        x[0, topk_idx] = x0[0, topk_idx]
+
+    return x  # (1, P+G)
 
 def _sample_categorical(probs: torch.Tensor) -> torch.Tensor:
     # Gumbel-Max trick; probs: (B, L, V)
     g = -torch.log(-torch.log(torch.rand_like(probs) + 1e-10) + 1e-10)
     return (probs.clamp_min(1e-12).log() + g).argmax(dim=-1)
-
+    
 @torch.no_grad()
 def generate_with_remdm(
     model,
@@ -925,6 +1047,10 @@ def generate_with_remdm(
     P = prompt.shape[1]
     L = gen_length
 
+    # 확률/엔트로피 계산은 float32로 통일 (bf16 로짓을 f32로 올려 안정화)
+    fp = torch.float32
+    neg_inf_fp = torch.tensor(-float('inf'), device=device, dtype=fp)
+
     # 시퀀스 준비
     x = torch.full((B, P + L), mask_id, dtype=torch.long, device=device)
     x[:, :P] = prompt.clone()
@@ -939,24 +1065,24 @@ def generate_with_remdm(
             un_x = x.clone()
             un_x[prompt_mask] = mask_id
             x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits
+            logits = model(x_).logits.to(fp)
             logits, un_logits = torch.chunk(logits, 2, dim=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
         else:
-            logits = model(x).logits  # (B, P+L, V)
+            logits = model(x).logits.to(fp)  # (B, P+L, V)
 
         if temperature > 0.0:
             logits = logits / max(1e-6, temperature)
 
-        probs = F.softmax(logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)  # fp32
         mask_pos = (x == mask_id) & (~prompt_mask)
         if not mask_pos.any():
             break
 
         # 위치별 후보/확신
         cand = probs.argmax(dim=-1)  # (B, P+L)
-        conf = torch.gather(probs, -1, cand.unsqueeze(-1)).squeeze(-1)
-        conf = torch.where(mask_pos, conf, torch.tensor(-float('inf'), device=device))
+        conf = torch.gather(probs, -1, cand.unsqueeze(-1)).squeeze(-1)  # (B, P+L) fp32
+        conf = torch.where(mask_pos, conf, neg_inf_fp)
 
         # 한 번에 너무 많이 채우지 않도록 소분할
         k = min(max(1, (tokens_to_fill + 3) // 4), tokens_to_fill)
@@ -965,8 +1091,8 @@ def generate_with_remdm(
         tokens_to_fill -= k
 
     # ---------- 2) ReMDM-conf 루프: 정식 q¹/q² 전이 ----------
-    # conf 캐시: 논문식 - 마지막 언마스크 시점의 디코딩 확률(부호 반대 저장)
-    conf_cache = torch.full_like(x, fill_value=-float('inf'), dtype=torch.float32)
+    # conf 캐시: 논문식 - 마지막 언마스크 시점의 디코딩 확률(부호 반대 저장). fp32로 유지
+    conf_cache = torch.full_like(x, fill_value=-float('inf'), dtype=fp)
 
     eps = 1e-5
     timesteps = torch.linspace(1.0, eps, steps=loop_steps + 1, device=device)  # 1 → eps
@@ -981,16 +1107,16 @@ def generate_with_remdm(
             un_x = x.clone()
             un_x[prompt_mask] = mask_id
             x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits
+            logits = model(x_).logits.to(fp)
             logits, un_logits = torch.chunk(logits, 2, dim=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
         else:
-            logits = model(x).logits
+            logits = model(x).logits.to(fp)
 
         if temperature > 0.0:
             logits = logits / max(1e-6, temperature)
 
-        p_x0 = F.softmax(logits, dim=-1)  # (B, P+L, V)
+        p_x0 = F.softmax(logits, dim=-1)  # (B, P+L, V), fp32
 
         # α_t, α_s, σ_max
         alpha_t = max(0.0, 1.0 - t)
@@ -1000,10 +1126,10 @@ def generate_with_remdm(
 
         # η = softmax(conf_cache)  (마스크 위치는 0)
         eta = torch.softmax(conf_cache, dim=-1)
-        eta = torch.where((x == mask_id), torch.zeros_like(eta), eta)
+        eta = torch.where((x == mask_id), torch.zeros_like(eta, dtype=fp), eta)
 
         # σ (토큰별): σ = η * σ_max
-        sigma = eta * sigma_max  # (B, P+L)
+        sigma = eta * sigma_max  # (B, P+L), fp32
 
         # 전이 분포 q¹(언마스크용), q²(마스크용)
         q1 = p_x0 * (1.0 - sigma[:, :, None])
@@ -1027,11 +1153,11 @@ def generate_with_remdm(
         #  - 언마스크→마스크: conf = -inf
         became_unmasked = (x == mask_id) & (xs != mask_id)
         became_masked   = (x != mask_id) & (xs == mask_id)
-        chosen_prob = torch.gather(p_x0, -1, xs.unsqueeze(-1)).squeeze(-1)  # (B, P+L)
+        chosen_prob = torch.gather(p_x0, -1, xs.unsqueeze(-1)).squeeze(-1)  # (B, P+L), fp32
 
         conf_cache = conf_cache.clone()
-        conf_cache[became_unmasked] = (-chosen_prob)[became_unmasked]
-        conf_cache[became_masked]   = -float('inf')
+        conf_cache[became_unmasked] = (-chosen_prob)[became_unmasked].to(conf_cache.dtype)
+        conf_cache[became_masked]   = neg_inf_fp
 
         x = xs
 
@@ -1041,16 +1167,16 @@ def generate_with_remdm(
             un_x = x.clone()
             un_x[prompt_mask] = mask_id
             x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits
+            logits = model(x_).logits.to(fp)
             logits, un_logits = torch.chunk(logits, 2, dim=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
         else:
-            logits = model(x).logits
+            logits = model(x).logits.to(fp)
 
         if temperature > 0.0:
             logits = logits / max(1e-6, temperature)
 
-        p = F.softmax(logits, dim=-1)
+        p = F.softmax(logits, dim=-1)  # fp32
         cand = _sample_categorical(p)
         mask_pos = (x == mask_id)
         x[mask_pos] = cand[mask_pos]

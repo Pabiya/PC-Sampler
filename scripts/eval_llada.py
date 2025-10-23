@@ -328,6 +328,21 @@ class LLaDAEvalHarness(LM):
                     refine_every=getattr(self, "refine_every", 1),
                     nucleus_p=getattr(self, "nucleus_p", 1.0),
                 )
+            elif self.mode == 'remdm':
+                from src.generate import generate_with_remdm
+                generated_answer = generate_with_remdm(
+                    self.model,
+                    prompt,
+                    gen_length=self.gen_length,
+                    init_unmask_ratio=getattr(self, "init_unmask_ratio", 0.75),
+                    unmask_k=getattr(self, "unmask_k", 1),
+                    loop_steps=getattr(self, "loop_steps", 256),
+                    temperature=self.temperature,
+                    cfg_scale=0.0,
+                    tokenizer=self.tokenizer,
+                    # 엔트로피 REMDM을 구현했다면 아래 인자도 전달:
+                    # confidence_metric=getattr(self, "remdm_metric", "prob"),
+                )
             else:
                 raise NotImplementedError(f"Mode {self.mode} not implemented.")
             
