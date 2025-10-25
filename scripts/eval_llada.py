@@ -59,6 +59,9 @@ class LLaDAEvalHarness(LM):
         num_remask_tokens=4,
         refine_every=1,
         nucleus_p=1.0,
+        refine_select='multinomial',
+        refine_K=-1,
+        entropy_remove_mask_prob=1,
         **kwargs,
     ):
         '''
@@ -133,6 +136,9 @@ class LLaDAEvalHarness(LM):
         self.num_remask_tokens = num_remask_tokens
         self.refine_every = refine_every
         self.nucleus_p = nucleus_p
+        self.refine_select = refine_select
+        self.refine_K = refine_K
+        self.entropy_remove_mask_prob = entropy_remove_mask_prob
 
     @property
     def rank(self):
@@ -327,6 +333,10 @@ class LLaDAEvalHarness(LM):
                     remasking=self.remasking,
                     refine_every=getattr(self, "refine_every", 1),
                     nucleus_p=getattr(self, "nucleus_p", 1.0),
+                    refine_select=getattr(self, "refine_select", "multinomial"),
+                    refine_K=(None if getattr(self, "refine_K", -1) < 0 else int(getattr(self, "refine_K", -1))),
+                    entropy_remove_mask_prob=bool(getattr(self, "entropy_remove_mask_prob", 1)),
+                    cfg_scale=0.0,
                 )
             elif self.mode == 'remdm':
                 from src.generate import generate_with_remdm

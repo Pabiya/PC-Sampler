@@ -258,6 +258,149 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     if return_order:
         return x, orders        
     return x
+
+# @torch.no_grad()
+# def generate_with_refine_ent3(
+#     model,
+#     prompt,
+#     steps=128,
+#     gen_length=128,
+#     block_length=128,
+#     temperature=0.0,
+#     remasking='low_confidence',
+#     mask_id=126336,
+#     refine_every=1,
+#     nucleus_p=1.0,
+#     return_order=False,
+# ):
+#     """
+#     LLaDA용 refine-ent-3 (B-type) 샘플러:
+#       1) 각 스텝에서 기본 전이로 일부 토큰 언마스크
+#       2) 주기(refine_every)마다 R 위치를 선택해 2nd-forward로 즉시 refine
+#       3) refine 직후 분포로 해당 위치의 entropy를 재계산하여 confidence 캐시에 '덮어쓰기'
+#     """
+#     device = model.device
+#     B = 1
+#     x = torch.full((B, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=device)
+#     x[:, :prompt.shape[1]] = prompt.clone()
+
+#     if return_order:
+#         orders = {}
+
+#     assert gen_length % block_length == 0
+#     num_blocks = gen_length // block_length
+
+#     assert steps % num_blocks == 0
+#     steps_per_block = steps // num_blocks
+
+#     # dtype을 float32로 통일해 확률/엔트로피 계산의 안정성 확보
+#     fp = torch.float32
+#     eps = torch.finfo(fp).eps
+
+#     # confidence 캐시 (entropy). 초기에는 매우 낮게 설정
+#     conf = torch.full_like(x, fill_value=-1e9, dtype=fp)
+
+#     step_counter = 0
+
+#     for num_block in range(num_blocks):
+#         blk_lo = prompt.shape[1] + num_block * block_length
+#         blk_hi = prompt.shape[1] + (num_block + 1) * block_length
+#         block_mask_index = (x[:, blk_lo:blk_hi] == mask_id)
+#         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+#         for i in range(steps_per_block):
+#             mask_index = (x == mask_id)
+
+#             # predictor
+#             logits = model(x).logits.to(fp)  # float32 변환
+#             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+#             x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L)
+
+#             # confidence(=1-entropy 아님! 아래에서 entropy 계산 전까진 top1 확률로 사용)
+#             if remasking == 'low_confidence':
+#                 p = F.softmax(logits, dim=-1)  # fp32
+#                 x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1).to(fp)  # (B, L)
+#             elif remasking == 'random':
+#                 x0_p = torch.rand_like(x0, dtype=fp)
+#             else:
+#                 raise NotImplementedError(remasking)
+
+#             # 블록 밖은 아직 잠금
+#             x0_p[:, blk_hi:] = -np.inf
+#             x0 = torch.where(mask_index, x0, x)
+#             confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device, dtype=fp))
+
+#             # 해당 스텝에서 확정할 개수만 선택
+#             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
+#             for b in range(B):
+#                 k = int(num_transfer_tokens[b, i].item())
+#                 if k > 0:
+#                     _, sel = torch.topk(confidence[b], k=k)
+#                     transfer_index[b, sel] = True
+#                     if return_order:
+#                         blk = num_block + 1
+#                         if blk not in orders:
+#                             orders[blk] = []
+#                         orders[blk].append((sel - prompt.shape[1]).tolist())
+#             x[transfer_index] = x0[transfer_index]
+
+#             # --- (B) in-step 2-forward refine (refine_every 간격) ---
+#             if (step_counter % max(1, refine_every)) == 0:
+#                 # 1) 확정된 위치들 중 [MASK]가 아닌 곳만 대상으로 entropy 기반 선택 가중치
+#                 with torch.no_grad():
+#                     p1 = F.softmax(logits, dim=-1).clamp_min(eps)  # fp32
+#                     p1_wo = p1.clone()
+#                     p1_wo[..., mask_id] = 0.0
+#                     Z = p1_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
+#                     q = p1_wo / Z
+#                     H = -(q * (q + eps).log()).sum(dim=-1)  # (B, L) entropy, fp32
+
+#                 # [MASK]였던 곳 제외
+#                 unmasked_flag = (x != mask_id)
+#                 eta = torch.softmax(H, dim=-1).masked_fill(~unmasked_flag, 0.0)  # 확정 위치만 후보
+#                 # sigma = eta * sigma_max → LLaDA에는 명시적 schedule이 없으므로 sigma_max=1.0 사용
+#                 sigma = eta.clamp(0.0, 1.0)
+#                 R = (torch.rand_like(sigma) < sigma) & unmasked_flag
+#                 if R.any():
+#                     # 2) R만 remask하여 2nd forward
+#                     x_tmp = x.clone()
+#                     x_tmp[R] = mask_id
+#                     logits2 = model(x_tmp).logits.to(fp)  # fp32
+
+#                     # nucleus(top-p) 옵션
+#                     if nucleus_p < 1.0:
+#                         p2 = F.softmax(logits2, dim=-1)  # fp32
+#                         sorted_probs, sorted_idx = torch.sort(p2, dim=-1, descending=True)
+#                         cprob = torch.cumsum(sorted_probs, dim=-1)
+#                         keep = (cprob <= nucleus_p)
+#                         keep[..., 0] = True
+#                         nucleus = sorted_probs * keep
+#                         nucleus = nucleus / nucleus.sum(dim=-1, keepdim=True).clamp_min(eps)
+#                         p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_idx, nucleus)
+#                     else:
+#                         p_x0_2 = F.softmax(logits2, dim=-1)  # fp32
+
+#                     # 3) R 위치만 재샘플 → 즉시 덮어쓰기
+#                     sampled2 = torch.argmax(
+#                         add_gumbel_noise(torch.log(p_x0_2.clamp_min(eps)), temperature=0.0),
+#                         dim=-1
+#                     )
+#                     x[R] = sampled2[R]
+
+#                     # 4) (핵심) refine 직후 분포의 entropy로 conf 캐시 덮어쓰기
+#                     P2 = p_x0_2.clamp_min(eps)  # fp32
+#                     P2[..., mask_id] = 0.0
+#                     Z2 = P2.sum(dim=-1, keepdim=True).clamp_min(eps)
+#                     Q2 = P2 / Z2
+#                     H2 = -(Q2 * (Q2 + eps).log()).sum(dim=-1)
+#                     conf[R] = H2[R].to(conf.dtype)
+
+#             step_counter += 1
+
+#     if return_order:
+#         return x, orders
+#     return x
+
 @torch.no_grad()
 def generate_with_refine_ent3(
     model,
@@ -266,109 +409,181 @@ def generate_with_refine_ent3(
     gen_length=128,
     block_length=128,
     temperature=0.0,
-    remasking='low_confidence',
+    remasking='low_confidence',   # 기본 전이는 기존 LLaDA의 선택 기준 그대로 사용
     mask_id=126336,
-    refine_every=1,
-    nucleus_p=1.0,
+    refine_every=1,               # k 스텝마다 1회 실행 (k=1이면 매 스텝)
+    nucleus_p=1.0,                # 2nd forward에도 동일 top-p 적용
+    refine_select="multinomial",  # "multinomial" | "topk"
+    refine_K=None,                # None -> 이번 스텝의 nun(언마스크 예산) 사용, 아니면 고정 K(스텝마다 min(K, nun))
+    entropy_remove_mask_prob=True,# 엔트로피 계산 시 [MASK] 확률 제거/재정규화
+    cfg_scale=0.0,                # CFG 스케일(0이면 비활성)
     return_order=False,
 ):
     """
-    LLaDA용 refine-ent-3 (B-type) 샘플러:
-      1) 각 스텝에서 기본 전이로 일부 토큰 언마스크
-      2) 주기(refine_every)마다 R 위치를 선택해 2nd-forward로 즉시 refine
-      3) refine 직후 분포로 해당 위치의 entropy를 재계산하여 confidence 캐시에 '덮어쓰기'
+    LLaDA + MIRAGE (옵션 A, C=프롬프트 제외 전체 생성 구간의 언마스크 위치)
+      1) LLaDA 전이로 이번 스텝 언마스크 실행
+      2) (주기적으로) C에서 R을 선택 → R만 remask → 2nd forward → R만 재언마스크
+      3) conf 캐시: [MASK]->token 된 곳은 H1, refine된 R은 H2로 덮어쓰기
     """
     device = model.device
     B = 1
-    x = torch.full((B, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=device)
-    x[:, :prompt.shape[1]] = prompt.clone()
+    P = prompt.shape[1]
+    L = gen_length
+    fp = torch.float32
+    eps = torch.finfo(fp).eps
+
+    # 고정 프롬프트 마스크 (프롬프트 위치 True)
+    x = torch.full((B, P + L), mask_id, dtype=torch.long, device=device)
+    x[:, :P] = prompt.clone()
+    prompt_mask_fixed = torch.zeros_like(x, dtype=torch.bool)
+    prompt_mask_fixed[:, :P] = True
 
     if return_order:
         orders = {}
 
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
+    assert L % block_length == 0
+    num_blocks = L // block_length
 
     assert steps % num_blocks == 0
     steps_per_block = steps // num_blocks
 
-    # dtype을 float32로 통일해 확률/엔트로피 계산의 안정성 확보
-    fp = torch.float32
-    eps = torch.finfo(fp).eps
+    # ── CFG/로짓 헬퍼 (fp32 반환)
+    def forward_logits(seq):
+        if cfg_scale and cfg_scale > 0.0:
+            un_x = seq.clone()
+            un_x[~prompt_mask_fixed] = un_x[~prompt_mask_fixed]  # no-op, 가독성용
+            un_x[prompt_mask_fixed] = mask_id                    # 프롬프트 제거한 언컨디셔닝
+            x_cat = torch.cat([seq, un_x], dim=0)                # (2, T)
+            logits = model(x_cat).logits.to(fp)
+            cond, uncond = torch.chunk(logits, 2, dim=0)         # (1,T,V) each
+            return (uncond + (cfg_scale + 1.0) * (cond - uncond)).to(fp)
+        else:
+            return model(seq).logits.to(fp)
 
-    # confidence 캐시 (entropy). 초기에는 매우 낮게 설정
-    conf = torch.full_like(x, fill_value=-1e9, dtype=fp)
+    # 엔트로피 도우미
+    def entropy_from_probs(P, remove_mask_prob=True):
+        # P: (B, T, V) 확률, fp32
+        P = P.clamp_min(eps)
+        if remove_mask_prob:
+            P_wo = P.clone()
+            P_wo[..., mask_id] = 0.0
+            Z = P_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
+            Q = P_wo / Z
+        else:
+            Z = P.sum(dim=-1, keepdim=True).clamp_min(eps)
+            Q = P / Z
+        H = -(Q * (Q + eps).log()).sum(dim=-1)  # (B, T)
+        return H
+
+    # conf 캐시(엔트로피): 처음엔 -inf
+    conf = torch.full((B, P + L), -float("inf"), dtype=fp, device=device)
 
     step_counter = 0
 
     for num_block in range(num_blocks):
-        blk_lo = prompt.shape[1] + num_block * block_length
-        blk_hi = prompt.shape[1] + (num_block + 1) * block_length
+        blk_lo = P + num_block * block_length
+        blk_hi = P + (num_block + 1) * block_length
+
         block_mask_index = (x[:, blk_lo:blk_hi] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
         for i in range(steps_per_block):
+            # ────────────── (1) 기본 LLaDA 전이: 이번 스텝 언마스크 ──────────────
             mask_index = (x == mask_id)
 
-            # predictor
-            logits = model(x).logits.to(fp)  # float32 변환
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L)
+            logits = forward_logits(x)                     # (B, T, V)
+            if temperature > 0.0:
+                logits = logits / max(1e-6, temperature)
 
-            # confidence(=1-entropy 아님! 아래에서 entropy 계산 전까진 top1 확률로 사용)
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)   # (B, T)
+
             if remasking == 'low_confidence':
-                p = F.softmax(logits, dim=-1)  # fp32
-                x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1).to(fp)  # (B, L)
+                p1 = F.softmax(logits, dim=-1)             # (B, T, V) fp32
+                x0_p = torch.gather(p1, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, T)
             elif remasking == 'random':
+                p1 = F.softmax(logits, dim=-1)             # 그래도 p1은 뒤에서 엔트로피용으로 사용
                 x0_p = torch.rand_like(x0, dtype=fp)
             else:
                 raise NotImplementedError(remasking)
 
-            # 블록 밖은 아직 잠금
+            # 블록 경계 밖은 잠금
             x0_p[:, blk_hi:] = -np.inf
             x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=device, dtype=fp))
 
-            # 해당 스텝에서 확정할 개수만 선택
+            # 이번 스텝 nun만큼 선택
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
             for b in range(B):
-                k = int(num_transfer_tokens[b, i].item())
-                if k > 0:
-                    _, sel = torch.topk(confidence[b], k=k)
+                nun = int(num_transfer_tokens[b, i].item())
+                if nun > 0:
+                    _, sel = torch.topk(confidence[b], k=nun)
                     transfer_index[b, sel] = True
                     if return_order:
                         blk = num_block + 1
                         if blk not in orders:
                             orders[blk] = []
-                        orders[blk].append((sel - prompt.shape[1]).tolist())
+                        orders[blk].append((sel - P).tolist())
+
+            # 언마스크 적용
+            became_unmasked = transfer_index & (x == mask_id)
             x[transfer_index] = x0[transfer_index]
 
-            # --- (B) in-step 2-forward refine (refine_every 간격) ---
-            if (step_counter % max(1, refine_every)) == 0:
-                # 1) 확정된 위치들 중 [MASK]가 아닌 곳만 대상으로 entropy 기반 선택 가중치
-                with torch.no_grad():
-                    p1 = F.softmax(logits, dim=-1).clamp_min(eps)  # fp32
-                    p1_wo = p1.clone()
-                    p1_wo[..., mask_id] = 0.0
-                    Z = p1_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
-                    q = p1_wo / Z
-                    H = -(q * (q + eps).log()).sum(dim=-1)  # (B, L) entropy, fp32
+            # --- H1 워밍업: 이번 스텝 막 언마스크된 위치의 엔트로피 기록 ---
+            H1 = entropy_from_probs(p1, remove_mask_prob=entropy_remove_mask_prob)
+            conf[became_unmasked] = H1[became_unmasked]
 
-                # [MASK]였던 곳 제외
-                unmasked_flag = (x != mask_id)
-                eta = torch.softmax(H, dim=-1).masked_fill(~unmasked_flag, 0.0)  # 확정 위치만 후보
-                # sigma = eta * sigma_max → LLaDA에는 명시적 schedule이 없으므로 sigma_max=1.0 사용
-                sigma = eta.clamp(0.0, 1.0)
-                R = (torch.rand_like(sigma) < sigma) & unmasked_flag
+            # ────────────── (2) MIRAGE: in-step 2nd forward (주기적) ──────────────
+            if (step_counter % max(1, refine_every)) == 0:
+                # 후보 C: 프롬프트 제외 & 현재 언마스크된 전체 생성 구간
+                C = (~prompt_mask_fixed) & (x != mask_id)  # (B, T)
+
+                # η = softmax(conf) on C (전부 -inf면 fallback)
+                eta_in = torch.where(C, conf, torch.tensor(-float('inf'), device=device, dtype=fp))
+                eta = torch.softmax(eta_in, dim=-1)        # (B, T)
+
+                bad_rows = ~torch.isfinite(eta.sum(dim=-1))
+                if bad_rows.any():
+                    eta_fb = torch.softmax(
+                        torch.where(C, H1, torch.tensor(-float('inf'), device=device, dtype=fp)),
+                        dim=-1
+                    )
+                    eta[bad_rows] = eta_fb[bad_rows]
+
+                # 이번 스텝 리파인 예산 K_eff (None이면 nun 사용)
+                K_vec = []
+                for b in range(B):
+                    nun = int(num_transfer_tokens[b, i].item())
+                    k_req = nun if refine_K is None else int(refine_K)
+                    # 후보 수로 클립
+                    k_eff = min(k_req, int(C[b].sum().item()))
+                    K_vec.append(k_eff)
+                K_vec = torch.tensor(K_vec, device=device, dtype=torch.long)
+
+                # 배치별 선택 마스크 R
+                R = torch.zeros_like(C, dtype=torch.bool, device=device)
+                for b in range(B):
+                    k = int(K_vec[b].item())
+                    if k <= 0:
+                        continue
+                    if refine_select == "topk":
+                        _, idx = torch.topk(eta[b], k=k)
+                    else:
+                        # multinomial(무중복). 확률합 1이어야 함
+                        idx = torch.multinomial(eta[b], num_samples=k, replacement=False)
+                    R[b, idx] = True
+                R = R & C  # 안전
+
                 if R.any():
-                    # 2) R만 remask하여 2nd forward
+                    # R만 remask한 컨텍스트로 2nd forward
                     x_tmp = x.clone()
                     x_tmp[R] = mask_id
-                    logits2 = model(x_tmp).logits.to(fp)  # fp32
 
-                    # nucleus(top-p) 옵션
+                    logits2 = forward_logits(x_tmp).to(fp)
+
+                    # nucleus(top-p) 적용
                     if nucleus_p < 1.0:
-                        p2 = F.softmax(logits2, dim=-1)  # fp32
+                        p2 = F.softmax(logits2, dim=-1)
                         sorted_probs, sorted_idx = torch.sort(p2, dim=-1, descending=True)
                         cprob = torch.cumsum(sorted_probs, dim=-1)
                         keep = (cprob <= nucleus_p)
@@ -377,29 +592,24 @@ def generate_with_refine_ent3(
                         nucleus = nucleus / nucleus.sum(dim=-1, keepdim=True).clamp_min(eps)
                         p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_idx, nucleus)
                     else:
-                        p_x0_2 = F.softmax(logits2, dim=-1)  # fp32
+                        p_x0_2 = F.softmax(logits2, dim=-1)
 
-                    # 3) R 위치만 재샘플 → 즉시 덮어쓰기
+                    # R 위치만 재샘플 → 즉시 덮어쓰기
                     sampled2 = torch.argmax(
                         add_gumbel_noise(torch.log(p_x0_2.clamp_min(eps)), temperature=0.0),
                         dim=-1
                     )
                     x[R] = sampled2[R]
 
-                    # 4) (핵심) refine 직후 분포의 entropy로 conf 캐시 덮어쓰기
-                    P2 = p_x0_2.clamp_min(eps)  # fp32
-                    P2[..., mask_id] = 0.0
-                    Z2 = P2.sum(dim=-1, keepdim=True).clamp_min(eps)
-                    Q2 = P2 / Z2
-                    H2 = -(Q2 * (Q2 + eps).log()).sum(dim=-1)
-                    conf[R] = H2[R].to(conf.dtype)
+                    # H2로 conf 덮어쓰기
+                    H2 = entropy_from_probs(p_x0_2, remove_mask_prob=entropy_remove_mask_prob)
+                    conf[R] = H2[R]
 
             step_counter += 1
 
     if return_order:
         return x, orders
     return x
-
 
 @torch.no_grad()
 def generate_with_pc_sampler(model, prompt, steps=128, gen_length=128, block_length=128, lambd=1, alpha=1, baseline_name='P_baseline.json', temperature=0.,

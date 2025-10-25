@@ -13,7 +13,7 @@ from src.llama_template import llama_prompt
 
 random.seed(42)
 
-def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens, refine_every=1, nucleus_p=1.0, init_unmask_ratio=0.75, loop_steps=256, unmask_k=1):
+def generate(model, tokenizer, input, task, steps, gen_length, block_length, temperature, mode, lambd, alpha, baseline_name, thread, gamma, num_remask_tokens, refine_every=1, nucleus_p=1.0, init_unmask_ratio=0.75, loop_steps=256, unmask_k=1, refine_select="multinomial", refine_K=-1, entropy_remove_mask_prob=1, cfg_scale=0.0):
 
     query = query_extract(input, task)
     m = [{"role": "user", "content": query}]
@@ -64,7 +64,11 @@ def generate(model, tokenizer, input, task, steps, gen_length, block_length, tem
             temperature=temperature,
             remasking='low_confidence',
             refine_every=refine_every,
-            nucleus_p=nucleus_p
+            nucleus_p=nucleus_p,
+            refine_select=refine_select,
+            refine_K=None if refine_K < 0 else int(refine_K),
+            entropy_remove_mask_prob=bool(entropy_remove_mask_prob),
+            cfg_scale=cfg_scale
         )
     else:
         raise NotImplementedError(f"Mode {mode} not implemented.")
@@ -146,6 +150,10 @@ def main(args):
     # refine-ent-3
     refine_every = args.refine_every
     nucleus_p = args.nucleus_p
+    refine_select = args.refine_select
+    refine_K = args.refine_K
+    entropy_remove_mask_prob = args.entropy_remove_mask_prob
+    cfg_scale = args.cfg_scale
 
     dataset = load_dataset(data_path, task)
 
@@ -176,7 +184,11 @@ def main(args):
                 temperature, mode, lambd, alpha, baseline_name,
                 thread, gamma, num_remask_tokens,
                 refine_every=refine_every, nucleus_p=nucleus_p,
-                init_unmask_ratio=init_unmask_ratio, loop_steps=loop_steps, unmask_k=unmask_k
+                init_unmask_ratio=init_unmask_ratio, loop_steps=loop_steps, unmask_k=unmask_k,
+                refine_select=refine_select,
+                refine_K=refine_K,
+                entropy_remove_mask_prob=entropy_remove_mask_prob,
+                cfg_scale=cfg_scale,
             )
         results.append(answer)
 
@@ -209,5 +221,8 @@ if __name__ == '__main__':
     # refine-ent-3 전용 하이퍼파라미터
     parser.add_argument('--refine_every', type=int, default=1)
     parser.add_argument('--nucleus_p', type=float, default=1.0)
+    parser.add_argument('--refine_select', type=str, default='multinomial', choices=['multinomial', 'topk'])
+    parser.add_argument('--refine_K', type=int, default=-1, help='-1이면 스텝별 nun 사용, 양수면 고정 K')
+    parser.add_argument('--entropy_remove_mask_prob', type=int, default=1, help='1: [MASK] 확률 제거 후 재정규화로 엔트로피 계산, 0: 전체 분포로 계산')
     args = parser.parse_args()
     main(args)
