@@ -224,5 +224,6 @@ if __name__ == '__main__':
     parser.add_argument('--refine_select', type=str, default='multinomial', choices=['multinomial', 'topk'])
     parser.add_argument('--refine_K', type=int, default=-1, help='-1이면 스텝별 nun 사용, 양수면 고정 K')
     parser.add_argument('--entropy_remove_mask_prob', type=int, default=1, help='1: [MASK] 확률 제거 후 재정규화로 엔트로피 계산, 0: 전체 분포로 계산')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='CFG scale for refine_ent_3 (0.0 to disable)')
     args = parser.parse_args()
     main(args)
