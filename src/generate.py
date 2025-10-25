@@ -763,134 +763,168 @@ def generate_with_linear_position(model, prompt, steps=128, gen_length=128, bloc
         return x, orders
     return x
 
-def _confidence_from_logits(logits, x0, mask_index, mask_id, metric="prob"):
+@torch.no_grad()
+def generate_with_remdm(
+    model,
+    prompt,
+    gen_length=32,
+    init_unmask_ratio=0.875,   # 28/32
+    unmask_k=1,                # kept for API compatibility (unused in ReMDM-conf)
+    loop_steps=32,
+    temperature=0.0,           # per-position sampling temp (set >0 if you want more randomness)
+    cfg_scale=0.0,
+    remasking='low_confidence',# kept for API compatibility (unused in ReMDM-conf)
+    mask_id=126336,
+    tokenizer=None,
+):
     """
-    logits: (B, L, V)
-    x0:     (B, L)  argmax 토큰
-    mask_index: (B, L)  현재 샘플링 대상으로 삼을 위치(True)
-    metric: "prob" | "entropy"
-    반환: (B, L)  값이 클수록 더 빨리 확정할 위치
+    dtype-safe (bf16 모델 대응) ReMDM-heuristic 버전
+    - 확률/엔트로피 계산 경로를 float32로 통일
+    - torch.where 상수도 dtype/device 맞춰 생성
     """
+    device = model.device if hasattr(model, "device") else prompt.device
     fp = torch.float32
-    eps = torch.finfo(fp).eps
-    device = logits.device
+    neg_inf = torch.tensor(-float('inf'), device=device, dtype=fp)
+    pos_inf = torch.tensor(float('inf'), device=device, dtype=fp)
 
-    if metric == "prob":
-        p = F.softmax(logits.to(fp), dim=-1)
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1).to(fp)
-        conf = torch.where(mask_index, x0_p, torch.full_like(x0_p, -float("inf")))
-        return conf
+    assert 0.0 <= init_unmask_ratio <= 1.0, "init_unmask_ratio must be between 0 and 1"
+    num_initial_tokens = gen_length * init_unmask_ratio
+    assert num_initial_tokens == int(num_initial_tokens), "gen_length * init_unmask_ratio must be an integer"
+    num_initial_tokens = int(num_initial_tokens)
+    assert gen_length % unmask_k == 0, "gen_length must be divisible by unmask_k"
+    assert num_initial_tokens % unmask_k == 0, "init_unmask_ratio * gen_length must be divisible by unmask_k"
 
-    if metric == "entropy":
-        p = F.softmax(logits.to(fp), dim=-1).clamp_min(eps)
-        # [MASK] 토큰 확률을 제거한 뒤 재정규화 (언마스크 후보의 불확실성만 반영)
-        p_wo = p.clone()
-        p_wo[..., mask_id] = 0.0
-        Z = p_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
-        q = p_wo / Z
-        H = -(q * (q + eps).log()).sum(dim=-1)  # (B, L)
-        score = -H  # 값이 클수록 더 확정할만함
-        conf = torch.where(mask_index, score, torch.full_like(score, -float("inf")))
-        return conf
+    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+    prompt_index = (x != mask_id)
 
-    raise ValueError(f"Unknown confidence_metric: {metric}")
+    # ---------- 1) 초기 언마스킹 루프 ----------
+    num_loops = num_initial_tokens // unmask_k
+    for _ in range(num_loops):
+        mask_index = (x == mask_id)
+        if not mask_index.any():
+            break
 
-# @torch.no_grad()
-# def generate_with_remdm(model, prompt, gen_length=32, init_unmask_ratio=0.875, unmask_k=1, loop_steps=32, temperature=0., cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None):
-#     assert 0.0 <= init_unmask_ratio <= 1.0, "init_unmask_ratio must be between 0 and 1"
-#     num_initial_tokens = gen_length * init_unmask_ratio
-#     assert num_initial_tokens == int(num_initial_tokens), "gen_length * init_unmask_ratio must be an integer"
-#     num_initial_tokens = int(num_initial_tokens)
-#     assert gen_length % unmask_k == 0, "gen_length must be divisible by unmask_k"
-#     assert num_initial_tokens % unmask_k == 0, "init_unmask_ratio * gen_length must be divisible by unmask_k"
-#     x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-#     x[:, :prompt.shape[1]] = prompt.clone()
-#     prompt_index = (x != mask_id)
-#     num_loops = num_initial_tokens // unmask_k
-#     for _ in range(num_loops):
-#         mask_index = (x == mask_id)
-#         if not mask_index.any():
-#             break
+        # CFG (옵션) + logits → fp32
+        if cfg_scale > 0.:
+            un_x = x.clone()
+            un_x[prompt_index] = mask_id
+            x_ = torch.cat([x, un_x], dim=0)
+            logits = model(x_).logits.to(fp)
+            logits, un_logits = torch.chunk(logits, 2, dim=0)
+            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+        else:
+            logits = model(x).logits.to(fp)
 
-#         if cfg_scale > 0.:
-#             un_x = x.clone()
-#             un_x[prompt_index] = mask_id
-#             x_ = torch.cat([x, un_x], dim=0)
-#             logits = model(x_).logits
-#             logits, un_logits = torch.chunk(logits, 2, dim=0)
-#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#         else:
-#             logits = model(x).logits
-#         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-#         x0 = torch.argmax(logits_with_noise, dim=-1)
-#         p = F.softmax(logits, dim=-1)
-#         x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-#         confidence = torch.where(mask_index, x0_p, -torch.inf)
-#         _, select_indices = torch.topk(confidence, k=unmask_k)
-#         x[0, select_indices] = x0[0, select_indices]
-#         x_result = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
-#     for _ in range(loop_steps):
-#         unmasked_gen_index = (x != mask_id) & (~prompt_index)
-#         num_unmasked_gen = torch.sum(unmasked_gen_index).item()
-#         if num_unmasked_gen == 0:
-#             continue
-#         current_remask_k = min(unmask_k, num_unmasked_gen)
-#         if cfg_scale > 0.:
-#             un_x = x.clone()
-#             un_x[prompt_index] = mask_id
-#             x_ = torch.cat([x, un_x], dim=0)
-#             logits = model(x_).logits
-#             logits, un_logits = torch.chunk(logits, 2, dim=0)
-#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#         else:
-#             logits = model(x).logits
-#         p = F.softmax(logits, dim=-1)
-#         current_token_p = torch.gather(p, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
-#         confidence = torch.where(unmasked_gen_index, current_token_p, torch.inf)
-#         _, remask_indices = torch.topk(confidence, k=current_remask_k, largest=False)
-#         x[0, remask_indices] = mask_id
-#         mask_index_after_remask = (x == mask_id)
-#         if cfg_scale > 0.:
-#             un_x = x.clone()
-#             un_x[prompt_index] = mask_id
-#             x_ = torch.cat([x, un_x], dim=0)
-#             logits = model(x_).logits
-#             logits, un_logits = torch.chunk(logits, 2, dim=0)
-#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#         else:
-#             logits = model(x).logits
-#         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-#         x0 = torch.argmax(logits_with_noise, dim=-1)
-#         p_new = F.softmax(logits, dim=-1)
-#         x0_p_new = torch.gather(p_new, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-#         confidence_for_unmasking = torch.where(mask_index_after_remask, x0_p_new, -torch.inf)
-#         _, unmask_indices = torch.topk(confidence_for_unmasking, k=current_remask_k)
-#         x[0, unmask_indices] = x0[0, unmask_indices]
-#         x_result = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
-#     while (x == mask_id).any():
-#         mask_index = (x == mask_id)
-#         num_masked_left = torch.sum(mask_index).item()
-#         if num_masked_left == 0:
-#             break
-#         current_unmask_k = min(unmask_k, num_masked_left)
-#         if cfg_scale > 0.:
-#             un_x = x.clone()
-#             un_x[prompt_index] = mask_id
-#             x_ = torch.cat([x, un_x], dim=0)
-#             logits = model(x_).logits
-#             logits, un_logits = torch.chunk(logits, 2, dim=0)
-#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-#         else:
-#             logits = model(x).logits
-#         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-#         x0 = torch.argmax(logits_with_noise, dim=-1)
-#         p = F.softmax(logits, dim=-1)
-#         x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-#         confidence = torch.where(mask_index, x0_p, -torch.inf)
-#         _, select_indices = torch.topk(confidence, k=current_unmask_k)
-#         x[0, select_indices] = x0[0, select_indices]
-#         x_result = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
-#     return x
+        if temperature > 0.0:
+            logits = logits / max(1e-6, temperature)
+
+        logits_with_noise = add_gumbel_noise(logits, temperature=0.0)  # noise는 logits에만
+        x0 = torch.argmax(logits_with_noise, dim=-1)  # (1, L)
+
+        p = F.softmax(logits, dim=-1)  # fp32
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (1, L), fp32
+        confidence = torch.where(mask_index, x0_p, neg_inf)  # dtype/device 일치
+
+        _, select_indices = torch.topk(confidence, k=unmask_k, dim=1)
+        x[0, select_indices] = x0[0, select_indices]
+
+        if tokenizer is not None:
+            _ = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
+
+    # ---------- 2) 리마스킹/재언마스킹 루프 ----------
+    for _ in range(loop_steps):
+        unmasked_gen_index = (x != mask_id) & (~prompt_index)
+        num_unmasked_gen = int(torch.sum(unmasked_gen_index).item())
+        if num_unmasked_gen == 0:
+            continue
+        current_remask_k = min(unmask_k, num_unmasked_gen)
+
+        # 현재 토큰의 확신도 계산 (fp32)
+        if cfg_scale > 0.:
+            un_x = x.clone()
+            un_x[prompt_index] = mask_id
+            x_ = torch.cat([x, un_x], dim=0)
+            logits = model(x_).logits.to(fp)
+            logits, un_logits = torch.chunk(logits, 2, dim=0)
+            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+        else:
+            logits = model(x).logits.to(fp)
+
+        if temperature > 0.0:
+            logits = logits / max(1e-6, temperature)
+
+        p = F.softmax(logits, dim=-1)  # fp32
+        # 현재 선택된 토큰의 확률
+        current_token_p = torch.gather(p, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)  # (1, L), fp32
+        # 리마스크 후보: 확신도가 낮은 위치
+        confidence = torch.where(unmasked_gen_index, current_token_p, pos_inf)
+        _, remask_indices = torch.topk(confidence, k=current_remask_k, dim=1, largest=False)
+        x[0, remask_indices] = mask_id
+
+        # 리마스크 후 다시 언마스크
+        mask_index_after_remask = (x == mask_id)
+
+        if cfg_scale > 0.:
+            un_x = x.clone()
+            un_x[prompt_index] = mask_id
+            x_ = torch.cat([x, un_x], dim=0)
+            logits = model(x_).logits.to(fp)
+            logits, un_logits = torch.chunk(logits, 2, dim=0)
+            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+        else:
+            logits = model(x).logits.to(fp)
+
+        if temperature > 0.0:
+            logits = logits / max(1e-6, temperature)
+
+        logits_with_noise = add_gumbel_noise(logits, temperature=0.0)
+        x0 = torch.argmax(logits_with_noise, dim=-1)
+        p_new = F.softmax(logits, dim=-1)  # fp32
+        x0_p_new = torch.gather(p_new, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (1, L), fp32
+
+        confidence_for_unmasking = torch.where(mask_index_after_remask, x0_p_new, neg_inf)
+        _, unmask_indices = torch.topk(confidence_for_unmasking, k=current_remask_k, dim=1)
+        x[0, unmask_indices] = x0[0, unmask_indices]
+
+        if tokenizer is not None:
+            _ = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
+
+    # ---------- 3) 잔여 [MASK] 마무리 ----------
+    while (x == mask_id).any():
+        mask_index = (x == mask_id)
+        num_masked_left = int(torch.sum(mask_index).item())
+        if num_masked_left == 0:
+            break
+        current_unmask_k = min(unmask_k, num_masked_left)
+
+        if cfg_scale > 0.:
+            un_x = x.clone()
+            un_x[prompt_index] = mask_id
+            x_ = torch.cat([x, un_x], dim=0)
+            logits = model(x_).logits.to(fp)
+            logits, un_logits = torch.chunk(logits, 2, dim=0)
+            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+        else:
+            logits = model(x).logits.to(fp)
+
+        if temperature > 0.0:
+            logits = logits / max(1e-6, temperature)
+
+        logits_with_noise = add_gumbel_noise(logits, temperature=0.0)
+        x0 = torch.argmax(logits_with_noise, dim=-1)
+        p = F.softmax(logits, dim=-1)  # fp32
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (1, L), fp32
+
+        confidence = torch.where(mask_index, x0_p, neg_inf)
+        _, select_indices = torch.topk(confidence, k=current_unmask_k, dim=1)
+        x[0, select_indices] = x0[0, select_indices]
+
+        if tokenizer is not None:
+            _ = tokenizer.decode(x[0, prompt.shape[1]:], skip_special_tokens=False)
+
+    return x
+
 
 @torch.no_grad()
 def generate_with_remdm_paper(
@@ -1021,168 +1055,168 @@ def _sample_categorical(probs: torch.Tensor) -> torch.Tensor:
     # Gumbel-Max trick; probs: (B, L, V)
     g = -torch.log(-torch.log(torch.rand_like(probs) + 1e-10) + 1e-10)
     return (probs.clamp_min(1e-12).log() + g).argmax(dim=-1)
-    
-@torch.no_grad()
-def generate_with_remdm(
-    model,
-    prompt,
-    gen_length=32,
-    init_unmask_ratio=0.875,   # 28/32
-    unmask_k=1,                # kept for API compatibility (unused in ReMDM-conf)
-    loop_steps=32,
-    temperature=0.0,           # per-position sampling temp (set >0 if you want more randomness)
-    cfg_scale=0.0,
-    remasking='low_confidence',# kept for API compatibility (unused in ReMDM-conf)
-    mask_id=126336,
-    tokenizer=None,
-):
-    """
-    ReMDM-conf (정식 전이식) + LLaDA 초기/마무리 하이브리드 샘플러
-      1) 초기: LLaDA/MaskGiT 식으로 init_unmask_ratio*gen_length만큼 채우기
-      2) 루프: ReMDM-conf 전이(q¹/q²)로 loop_steps 스텝 진행 (토큰별 σ = softmax(conf)*σ_max)
-      3) 잔여 [MASK]: 다시 LLaDA로 마무리
-    """
-    device = model.device if hasattr(model, "device") else prompt.device
-    B = 1
-    P = prompt.shape[1]
-    L = gen_length
 
-    # 확률/엔트로피 계산은 float32로 통일 (bf16 로짓을 f32로 올려 안정화)
-    fp = torch.float32
-    neg_inf_fp = torch.tensor(-float('inf'), device=device, dtype=fp)
+# @torch.no_grad()
+# def generate_with_remdm(
+#     model,
+#     prompt,
+#     gen_length=32,
+#     init_unmask_ratio=0.875,   # 28/32
+#     unmask_k=1,                # kept for API compatibility (unused in ReMDM-conf)
+#     loop_steps=32,
+#     temperature=0.0,           # per-position sampling temp (set >0 if you want more randomness)
+#     cfg_scale=0.0,
+#     remasking='low_confidence',# kept for API compatibility (unused in ReMDM-conf)
+#     mask_id=126336,
+#     tokenizer=None,
+# ):
+#     """
+#     ReMDM-conf (정식 전이식) + LLaDA 초기/마무리 하이브리드 샘플러
+#       1) 초기: LLaDA/MaskGiT 식으로 init_unmask_ratio*gen_length만큼 채우기
+#       2) 루프: ReMDM-conf 전이(q¹/q²)로 loop_steps 스텝 진행 (토큰별 σ = softmax(conf)*σ_max)
+#       3) 잔여 [MASK]: 다시 LLaDA로 마무리
+#     """
+#     device = model.device if hasattr(model, "device") else prompt.device
+#     B = 1
+#     P = prompt.shape[1]
+#     L = gen_length
 
-    # 시퀀스 준비
-    x = torch.full((B, P + L), mask_id, dtype=torch.long, device=device)
-    x[:, :P] = prompt.clone()
-    prompt_mask = (x != mask_id)
+#     # 확률/엔트로피 계산은 float32로 통일 (bf16 로짓을 f32로 올려 안정화)
+#     fp = torch.float32
+#     neg_inf_fp = torch.tensor(-float('inf'), device=device, dtype=fp)
 
-    # ---------- 1) 초기 28/32: LLaDA/MaskGiT 진행형 채우기 ----------
-    init_tokens = int(L * init_unmask_ratio)
-    tokens_to_fill = init_tokens
-    while tokens_to_fill > 0 and (x == mask_id).any():
-        # CFG (옵션)
-        if cfg_scale > 0.:
-            un_x = x.clone()
-            un_x[prompt_mask] = mask_id
-            x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits.to(fp)
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-        else:
-            logits = model(x).logits.to(fp)  # (B, P+L, V)
+#     # 시퀀스 준비
+#     x = torch.full((B, P + L), mask_id, dtype=torch.long, device=device)
+#     x[:, :P] = prompt.clone()
+#     prompt_mask = (x != mask_id)
 
-        if temperature > 0.0:
-            logits = logits / max(1e-6, temperature)
+#     # ---------- 1) 초기 28/32: LLaDA/MaskGiT 진행형 채우기 ----------
+#     init_tokens = int(L * init_unmask_ratio)
+#     tokens_to_fill = init_tokens
+#     while tokens_to_fill > 0 and (x == mask_id).any():
+#         # CFG (옵션)
+#         if cfg_scale > 0.:
+#             un_x = x.clone()
+#             un_x[prompt_mask] = mask_id
+#             x_ = torch.cat([x, un_x], dim=0)
+#             logits = model(x_).logits.to(fp)
+#             logits, un_logits = torch.chunk(logits, 2, dim=0)
+#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+#         else:
+#             logits = model(x).logits.to(fp)  # (B, P+L, V)
 
-        probs = F.softmax(logits, dim=-1)  # fp32
-        mask_pos = (x == mask_id) & (~prompt_mask)
-        if not mask_pos.any():
-            break
+#         if temperature > 0.0:
+#             logits = logits / max(1e-6, temperature)
 
-        # 위치별 후보/확신
-        cand = probs.argmax(dim=-1)  # (B, P+L)
-        conf = torch.gather(probs, -1, cand.unsqueeze(-1)).squeeze(-1)  # (B, P+L) fp32
-        conf = torch.where(mask_pos, conf, neg_inf_fp)
+#         probs = F.softmax(logits, dim=-1)  # fp32
+#         mask_pos = (x == mask_id) & (~prompt_mask)
+#         if not mask_pos.any():
+#             break
 
-        # 한 번에 너무 많이 채우지 않도록 소분할
-        k = min(max(1, (tokens_to_fill + 3) // 4), tokens_to_fill)
-        _, idx = torch.topk(conf, k=k, dim=1)
-        x[torch.arange(B)[:, None], idx] = cand[torch.arange(B)[:, None], idx]
-        tokens_to_fill -= k
+#         # 위치별 후보/확신
+#         cand = probs.argmax(dim=-1)  # (B, P+L)
+#         conf = torch.gather(probs, -1, cand.unsqueeze(-1)).squeeze(-1)  # (B, P+L) fp32
+#         conf = torch.where(mask_pos, conf, neg_inf_fp)
 
-    # ---------- 2) ReMDM-conf 루프: 정식 q¹/q² 전이 ----------
-    # conf 캐시: 논문식 - 마지막 언마스크 시점의 디코딩 확률(부호 반대 저장). fp32로 유지
-    conf_cache = torch.full_like(x, fill_value=-float('inf'), dtype=fp)
+#         # 한 번에 너무 많이 채우지 않도록 소분할
+#         k = min(max(1, (tokens_to_fill + 3) // 4), tokens_to_fill)
+#         _, idx = torch.topk(conf, k=k, dim=1)
+#         x[torch.arange(B)[:, None], idx] = cand[torch.arange(B)[:, None], idx]
+#         tokens_to_fill -= k
 
-    eps = 1e-5
-    timesteps = torch.linspace(1.0, eps, steps=loop_steps + 1, device=device)  # 1 → eps
-    dt = (1.0 - eps) / max(1, loop_steps)
+#     # ---------- 2) ReMDM-conf 루프: 정식 q¹/q² 전이 ----------
+#     # conf 캐시: 논문식 - 마지막 언마스크 시점의 디코딩 확률(부호 반대 저장). fp32로 유지
+#     conf_cache = torch.full_like(x, fill_value=-float('inf'), dtype=fp)
 
-    for i in range(loop_steps):
-        t = timesteps[i].item()
-        t_s = max(eps, t - dt)
+#     eps = 1e-5
+#     timesteps = torch.linspace(1.0, eps, steps=loop_steps + 1, device=device)  # 1 → eps
+#     dt = (1.0 - eps) / max(1, loop_steps)
 
-        # logits → p_x0
-        if cfg_scale > 0.:
-            un_x = x.clone()
-            un_x[prompt_mask] = mask_id
-            x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits.to(fp)
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-        else:
-            logits = model(x).logits.to(fp)
+#     for i in range(loop_steps):
+#         t = timesteps[i].item()
+#         t_s = max(eps, t - dt)
 
-        if temperature > 0.0:
-            logits = logits / max(1e-6, temperature)
+#         # logits → p_x0
+#         if cfg_scale > 0.:
+#             un_x = x.clone()
+#             un_x[prompt_mask] = mask_id
+#             x_ = torch.cat([x, un_x], dim=0)
+#             logits = model(x_).logits.to(fp)
+#             logits, un_logits = torch.chunk(logits, 2, dim=0)
+#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+#         else:
+#             logits = model(x).logits.to(fp)
 
-        p_x0 = F.softmax(logits, dim=-1)  # (B, P+L, V), fp32
+#         if temperature > 0.0:
+#             logits = logits / max(1e-6, temperature)
 
-        # α_t, α_s, σ_max
-        alpha_t = max(0.0, 1.0 - t)
-        alpha_s = max(0.0, 1.0 - t_s)
-        denom = max(1e-12, alpha_t)
-        sigma_max = min(1.0, (1.0 - alpha_s) / denom)
+#         p_x0 = F.softmax(logits, dim=-1)  # (B, P+L, V), fp32
 
-        # η = softmax(conf_cache)  (마스크 위치는 0)
-        eta = torch.softmax(conf_cache, dim=-1)
-        eta = torch.where((x == mask_id), torch.zeros_like(eta, dtype=fp), eta)
+#         # α_t, α_s, σ_max
+#         alpha_t = max(0.0, 1.0 - t)
+#         alpha_s = max(0.0, 1.0 - t_s)
+#         denom = max(1e-12, alpha_t)
+#         sigma_max = min(1.0, (1.0 - alpha_s) / denom)
 
-        # σ (토큰별): σ = η * σ_max
-        sigma = eta * sigma_max  # (B, P+L), fp32
+#         # η = softmax(conf_cache)  (마스크 위치는 0)
+#         eta = torch.softmax(conf_cache, dim=-1)
+#         eta = torch.where((x == mask_id), torch.zeros_like(eta, dtype=fp), eta)
 
-        # 전이 분포 q¹(언마스크용), q²(마스크용)
-        q1 = p_x0 * (1.0 - sigma[:, :, None])
-        q1[..., mask_id] = sigma
+#         # σ (토큰별): σ = η * σ_max
+#         sigma = eta * sigma_max  # (B, P+L), fp32
 
-        num = alpha_s - (1.0 - sigma) * alpha_t
-        den = max(1e-12, (1.0 - alpha_t))
-        q2 = p_x0 * (num[:, :, None] / den)
-        q2[..., mask_id] = (1.0 - alpha_s - sigma * alpha_t) / den
+#         # 전이 분포 q¹(언마스크용), q²(마스크용)
+#         q1 = p_x0 * (1.0 - sigma[:, :, None])
+#         q1[..., mask_id] = sigma
 
-        is_unmasked = (x != mask_id)
-        q = torch.where(is_unmasked.unsqueeze(-1), q1, q2)
-        q = q.clamp_min(0)
-        q = q / (q.sum(dim=-1, keepdim=True) + 1e-12)
+#         num = alpha_s - (1.0 - sigma) * alpha_t
+#         den = max(1e-12, (1.0 - alpha_t))
+#         q2 = p_x0 * (num[:, :, None] / den)
+#         q2[..., mask_id] = (1.0 - alpha_s - sigma * alpha_t) / den
 
-        # 카테고리 샘플링
-        xs = _sample_categorical(q)  # (B, P+L)
+#         is_unmasked = (x != mask_id)
+#         q = torch.where(is_unmasked.unsqueeze(-1), q1, q2)
+#         q = q.clamp_min(0)
+#         q = q / (q.sum(dim=-1, keepdim=True) + 1e-12)
 
-        # conf 갱신 (논문식):
-        #  - 마스크→언마스크: conf = -p_x0[선택토큰]
-        #  - 언마스크→마스크: conf = -inf
-        became_unmasked = (x == mask_id) & (xs != mask_id)
-        became_masked   = (x != mask_id) & (xs == mask_id)
-        chosen_prob = torch.gather(p_x0, -1, xs.unsqueeze(-1)).squeeze(-1)  # (B, P+L), fp32
+#         # 카테고리 샘플링
+#         xs = _sample_categorical(q)  # (B, P+L)
 
-        conf_cache = conf_cache.clone()
-        conf_cache[became_unmasked] = (-chosen_prob)[became_unmasked].to(conf_cache.dtype)
-        conf_cache[became_masked]   = neg_inf_fp
+#         # conf 갱신 (논문식):
+#         #  - 마스크→언마스크: conf = -p_x0[선택토큰]
+#         #  - 언마스크→마스크: conf = -inf
+#         became_unmasked = (x == mask_id) & (xs != mask_id)
+#         became_masked   = (x != mask_id) & (xs == mask_id)
+#         chosen_prob = torch.gather(p_x0, -1, xs.unsqueeze(-1)).squeeze(-1)  # (B, P+L), fp32
 
-        x = xs
+#         conf_cache = conf_cache.clone()
+#         conf_cache[became_unmasked] = (-chosen_prob)[became_unmasked].to(conf_cache.dtype)
+#         conf_cache[became_masked]   = neg_inf_fp
 
-    # ---------- 3) 잔여 [MASK]는 LLaDA/MaskGiT로 마무리 ----------
-    while (x == mask_id).any():
-        if cfg_scale > 0.:
-            un_x = x.clone()
-            un_x[prompt_mask] = mask_id
-            x_ = torch.cat([x, un_x], dim=0)
-            logits = model(x_).logits.to(fp)
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-        else:
-            logits = model(x).logits.to(fp)
+#         x = xs
 
-        if temperature > 0.0:
-            logits = logits / max(1e-6, temperature)
+#     # ---------- 3) 잔여 [MASK]는 LLaDA/MaskGiT로 마무리 ----------
+#     while (x == mask_id).any():
+#         if cfg_scale > 0.:
+#             un_x = x.clone()
+#             un_x[prompt_mask] = mask_id
+#             x_ = torch.cat([x, un_x], dim=0)
+#             logits = model(x_).logits.to(fp)
+#             logits, un_logits = torch.chunk(logits, 2, dim=0)
+#             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+#         else:
+#             logits = model(x).logits.to(fp)
 
-        p = F.softmax(logits, dim=-1)  # fp32
-        cand = _sample_categorical(p)
-        mask_pos = (x == mask_id)
-        x[mask_pos] = cand[mask_pos]
+#         if temperature > 0.0:
+#             logits = logits / max(1e-6, temperature)
 
-    # 옵션: 디코드
-    if tokenizer is not None:
-        _ = tokenizer.decode(x[0, P:], skip_special_tokens=False)
+#         p = F.softmax(logits, dim=-1)  # fp32
+#         cand = _sample_categorical(p)
+#         mask_pos = (x == mask_id)
+#         x[mask_pos] = cand[mask_pos]
 
-    return x
+#     # 옵션: 디코드
+#     if tokenizer is not None:
+#         _ = tokenizer.decode(x[0, P:], skip_special_tokens=False)
+
+#     return x
